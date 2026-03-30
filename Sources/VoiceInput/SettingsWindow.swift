@@ -1,6 +1,6 @@
 import AppKit
 
-final class SettingsWindow: NSPanel {
+final class SettingsWindow: NSWindow, NSWindowDelegate {
     private let apiBaseURLField = NSTextField()
     private let apiKeyField = NSTextField()
     private let modelField = NSTextField()
@@ -15,6 +15,7 @@ final class SettingsWindow: NSPanel {
         )
         title = "LLM Refinement Settings"
         isReleasedWhenClosed = false
+        delegate = self
         setupUI()
         loadSettings()
         center()
@@ -80,6 +81,15 @@ final class SettingsWindow: NSPanel {
 
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
     }
 
     private func loadSettings() {

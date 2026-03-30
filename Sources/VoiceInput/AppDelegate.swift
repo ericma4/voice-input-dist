@@ -39,12 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        if !keyMonitor.start() {
-            showAccessibilityAlert()
-        }
-
         keyMonitor.onFnDown = { [weak self] in self?.fnDown() }
         keyMonitor.onFnUp = { [weak self] in self?.fnUp() }
+
+        requestAccessibilityIfNeeded()
     }
 
     // MARK: - Key events
@@ -247,9 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         enableMenuItem.state = isEnabled ? .on : .off
 
         if isEnabled {
-            if !keyMonitor.start() {
-                showAccessibilityAlert()
-            }
+            requestAccessibilityIfNeeded()
         } else {
             keyMonitor.stop()
             if isRecording {
@@ -278,8 +274,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openLLMSettings() {
-        settingsWindow.makeKeyAndOrderFront(nil)
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        setupAppMenu()
+        settingsWindow.makeKeyAndOrderFront(nil)
+    }
+
+    private func setupAppMenu() {
+        guard NSApp.mainMenu == nil else { return }
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit VoiceInput", action: #selector(quit), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
     @objc private func quit() {
@@ -287,29 +307,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: - Alerts
+    // MARK: - Accessibility
 
-    private func showAccessibilityAlert() {
-        let alert = NSAlert()
-        alert.messageText = "Accessibility Permission Required"
-        alert.informativeText = """
-            VoiceInput needs Accessibility permission to monitor the Fn key.
-
-            1. Open System Settings → Privacy & Security → Accessibility
-            2. Add and enable VoiceInput
-            3. Restart the app
-            """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Quit")
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(
-                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-            )
+    private func requestAccessibilityIfNeeded() {
+        if AXIsProcessTrusted() {
+            if !keyMonitor.start() {
+                // Trusted but tap failed — permission may have just been granted; retry once
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    _ = self?.keyMonitor.start()
+                }
+            }
+            return
         }
-        NSApp.terminate(nil)
+
+        // Prompt macOS to show its native accessibility permission dialog
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+
+        // Poll until the user grants permission (check every second, up to 60s)
+        var attempts = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            attempts += 1
+            if AXIsProcessTrusted() {
+                timer.invalidate()
+                _ = self?.keyMonitor.start()
+            } else if attempts >= 60 {
+                timer.invalidate()
+            }
+        }
     }
 
     private func showAlert(title: String, message: String) {
