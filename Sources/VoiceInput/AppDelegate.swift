@@ -6,11 +6,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let keyMonitor = KeyMonitor()
     private let speechEngine = SpeechEngine()
     private let whisperEngine = WhisperSpeechEngine()
+    private let senseVoiceEngine = SenseVoiceSpeechEngine()
     private let textInjector = TextInjector()
     private lazy var overlayPanel = OverlayPanel()
 
     private var isEnabled = true
     private var isRecording = false
+    private var recordingEngine: String?
     private var lastPartialResult = ""
     private var finalResultTimer: Timer?
 
@@ -26,8 +28,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var selectedEngine: String {
-        get { UserDefaults.standard.string(forKey: "selectedEngine") ?? "apple" }
+        get { UserDefaults.standard.string(forKey: "selectedEngine") ?? "auto" }
         set { UserDefaults.standard.set(newValue, forKey: "selectedEngine") }
+    }
+
+    private var activeEngine: String {
+        if selectedEngine == "auto" {
+            return defaultEngine(for: selectedLocaleCode)
+        }
+        return selectedEngine
     }
 
     // MARK: - Lifecycle
@@ -41,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusBar()
         setupSpeechCallbacks()
         setupWhisperCallbacks()
+        setupSenseVoiceCallbacks()
 
         SpeechEngine.requestPermissions { [weak self] granted, errorMsg in
             if !granted, let msg = errorMsg {
@@ -59,7 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func fnDown() {
         guard isEnabled, !isRecording else { return }
 
-        if selectedEngine == "whisper" && !whisperEngine.isModelLoaded {
+        let engine = activeEngine
+        if engine == "whisper" && !whisperEngine.isModelLoaded {
             overlayPanel.show(text: "Loading Whisper model…")
             whisperEngine.loadModel(progress: { [weak self] msg in
                 DispatchQueue.main.async { self?.overlayPanel.updateText(msg) }
@@ -79,14 +90,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         LLMRefiner.shared.cancel()
         isRecording = true
+        recordingEngine = engine
         lastPartialResult = ""
 
         updateStatusIcon(recording: true)
         overlayPanel.show(text: "Listening...")
         NSSound(named: .init("Tink"))?.play()
 
-        if selectedEngine == "whisper" {
+        if engine == "whisper" {
             whisperEngine.startRecording()
+        } else if engine == "sensevoice" {
+            senseVoiceEngine.startRecording()
         } else {
             speechEngine.startRecording()
         }
@@ -98,12 +112,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateStatusIcon(recording: false)
 
-        if selectedEngine == "whisper" {
+        let engine = recordingEngine ?? activeEngine
+        recordingEngine = nil
+
+        if engine == "whisper" {
             overlayPanel.updateText("Transcribing…")
             whisperEngine.stopRecording()
             // Use a longer timeout — Whisper transcribes after recording ends
             finalResultTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: false) { [weak self] _ in
                 self?.finishTranscription()
+            }
+        } else if engine == "sensevoice" {
+            overlayPanel.updateText("Transcribing with SenseVoice…")
+            senseVoiceEngine.stopRecording()
+            finalResultTimer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.senseVoiceEngine.cancel()
+                self.overlayPanel.updateText("SenseVoice timed out")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self.overlayPanel.dismiss()
+                }
             }
         } else {
             speechEngine.stopRecording()
@@ -165,6 +193,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         whisperEngine.onAudioLevel = { [weak self] level in
+            self?.overlayPanel.updateAudioLevel(level)
+        }
+    }
+
+    private func setupSenseVoiceCallbacks() {
+        senseVoiceEngine.onFinalResult = { [weak self] text in
+            guard let self else { return }
+            self.lastPartialResult = text
+            self.finalResultTimer?.invalidate()
+            self.finalResultTimer = nil
+            self.finishTranscription()
+        }
+
+        senseVoiceEngine.onError = { [weak self] msg in
+            guard let self else { return }
+            self.finalResultTimer?.invalidate()
+            self.finalResultTimer = nil
+            self.overlayPanel.updateText("Error: \(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.overlayPanel.dismiss()
+            }
+        }
+
+        senseVoiceEngine.onAudioLevel = { [weak self] level in
             self?.overlayPanel.updateAudioLevel(level)
         }
     }
@@ -271,8 +323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let engineItem = NSMenuItem(title: "Recognition Engine", action: nil, keyEquivalent: "")
         let engineMenu = NSMenu()
         let engines: [(String, String)] = [
+            ("Auto by Language", "auto"),
             ("Apple Speech", "apple"),
             ("Whisper Medium", "whisper"),
+            ("SenseVoice Small", "sensevoice"),
         ]
         for (name, key) in engines {
             let item = NSMenuItem(title: name, action: #selector(changeEngine(_:)), keyEquivalent: "")
@@ -330,8 +384,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             keyMonitor.stop()
             if isRecording {
-                if selectedEngine == "whisper" {
+                let engine = recordingEngine ?? activeEngine
+                recordingEngine = nil
+                if engine == "whisper" {
                     whisperEngine.cancel()
+                } else if engine == "sensevoice" {
+                    senseVoiceEngine.cancel()
                 } else {
                     speechEngine.cancel()
                 }
@@ -350,16 +408,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for item in languageItems {
             item.state = (item.representedObject as? String) == code ? .on : .off
         }
+        preloadWhisperIfNeeded()
     }
 
     @objc private func changeEngine(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         selectedEngine = key
-        for item in engineItems {
-            item.state = (item.representedObject as? String) == key ? .on : .off
+        updateEngineMenuState()
+        preloadWhisperIfNeeded()
+    }
+
+    private func defaultEngine(for localeCode: String) -> String {
+        let identifier = localeCode.isEmpty ? Locale.current.identifier : localeCode
+        let code = identifier.lowercased()
+        if code.hasPrefix("zh") {
+            return "sensevoice"
         }
-        // Pre-load the Whisper model in the background when selected
-        if key == "whisper" && !whisperEngine.isModelLoaded {
+        if code.hasPrefix("en") {
+            return "whisper"
+        }
+        return "apple"
+    }
+
+    private func updateEngineMenuState() {
+        for item in engineItems {
+            item.state = (item.representedObject as? String) == selectedEngine ? .on : .off
+        }
+    }
+
+    private func preloadWhisperIfNeeded() {
+        if activeEngine == "whisper" && !whisperEngine.isModelLoaded {
             whisperEngine.loadModel { _ in }
         }
     }

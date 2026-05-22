@@ -3,9 +3,22 @@
 <plist version="1.0">
 <dict>
 	<key>files</key>
-	<dict/>
+	<dict>
+		<key>Resources/sensevoice_transcribe.py</key>
+		<data>
+		/dpx2SWQWv5p4D6d8xoMETYl4t0=
+		</data>
+	</dict>
 	<key>files2</key>
-	<dict/>
+	<dict>
+		<key>Resources/sensevoice_transcribe.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			hYhYonf1YWL9QcmbyI9EET4y0tGAkR1V3oySI8fnIgE=
+			</data>
+		</dict>
+	</dict>
 	<key>rules</key>
 	<dict>
 		<key>^Resources/</key>

@@ -12,6 +12,7 @@ https://github.com/user-attachments/assets/3228f78a-f035-447d-98ef-8826798a122c
 
 - macOS 14.0 (Sonoma) or later
 - Xcode Command Line Tools (for `swift build`)
+- Optional for SenseVoice: Python 3 with the dependencies installed by `Scripts/setup_sensevoice.sh`
 
 ## Build & Run
 
@@ -21,6 +22,16 @@ make run     # build and launch
 make install # copy to /Applications
 make clean   # remove build artifacts
 ```
+
+## SenseVoice
+
+The app includes an optional `SenseVoice Small` engine for Chinese/English mixed input. Install its Python dependencies and warm the local model cache once:
+
+```bash
+Scripts/setup_sensevoice.sh
+```
+
+Then build/run the app and select `Recognition Engine` -> `Auto by Language` from the menu-bar menu. In auto mode, Chinese locales use `SenseVoice Small`, English locales use `Whisper Medium`, and other locales use `Apple Speech`.
 
 ## Source Code
 
