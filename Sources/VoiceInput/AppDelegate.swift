@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var enableMenuItem: NSMenuItem!
     private var llmMenuItem: NSMenuItem!
+    private var cleanupMenuItem: NSMenuItem!
     private lazy var settingsWindow = SettingsWindow()
     private var languageItems: [NSMenuItem] = []
     private var engineItems: [NSMenuItem] = []
@@ -30,6 +31,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var selectedEngine: String {
         get { UserDefaults.standard.string(forKey: "selectedEngine") ?? "auto" }
         set { UserDefaults.standard.set(newValue, forKey: "selectedEngine") }
+    }
+
+    private var removeChineseFillers: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: "removeChineseFillers") == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: "removeChineseFillers")
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "removeChineseFillers") }
     }
 
     private var activeEngine: String {
@@ -225,7 +236,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         finalResultTimer?.invalidate()
         finalResultTimer = nil
 
-        let text = lastPartialResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawText = lastPartialResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = postprocessTranscript(rawText)
 
         guard !text.isEmpty else {
             overlayPanel.dismiss()
@@ -283,6 +295,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func postprocessTranscript(_ text: String) -> String {
+        guard removeChineseFillers, isChineseInputSelected else {
+            return text
+        }
+        return SpeechTextPostprocessor.removingChineseFillers(from: text)
+    }
+
     // MARK: - Status bar
 
     private func setupStatusBar() {
@@ -318,6 +337,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         langItem.submenu = langMenu
         menu.addItem(langItem)
+
+        cleanupMenuItem = NSMenuItem(title: "Remove Chinese Fillers", action: #selector(toggleRemoveChineseFillers), keyEquivalent: "")
+        cleanupMenuItem.target = self
+        cleanupMenuItem.state = removeChineseFillers ? .on : .off
+        menu.addItem(cleanupMenuItem)
 
         // Recognition Engine submenu
         let engineItem = NSMenuItem(title: "Recognition Engine", action: nil, keyEquivalent: "")
@@ -416,6 +440,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectedEngine = key
         updateEngineMenuState()
         preloadWhisperIfNeeded()
+    }
+
+    @objc private func toggleRemoveChineseFillers() {
+        removeChineseFillers.toggle()
+        cleanupMenuItem.state = removeChineseFillers ? .on : .off
+    }
+
+    private var isChineseInputSelected: Bool {
+        let identifier = selectedLocaleCode.isEmpty ? Locale.current.identifier : selectedLocaleCode
+        return identifier.lowercased().hasPrefix("zh")
     }
 
     private func defaultEngine(for localeCode: String) -> String {
