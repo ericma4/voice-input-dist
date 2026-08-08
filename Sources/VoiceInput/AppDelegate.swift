@@ -1,549 +1,314 @@
 import AppKit
-import Speech
+import ApplicationServices
+import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private let keyMonitor = KeyMonitor()
-    private let speechEngine = SpeechEngine()
-    private let whisperEngine = WhisperSpeechEngine()
-    private let senseVoiceEngine = SenseVoiceSpeechEngine()
-    private let textInjector = TextInjector()
+    private let engineManager = EngineManager()
     private lazy var overlayPanel = OverlayPanel()
-
-    private var isEnabled = true
-    private var isRecording = false
-    private var recordingEngine: String?
-    private var lastPartialResult = ""
-    private var finalResultTimer: Timer?
-
-    private var enableMenuItem: NSMenuItem!
-    private var llmMenuItem: NSMenuItem!
-    private var cleanupMenuItem: NSMenuItem!
-    private lazy var settingsWindow = SettingsWindow()
-    private var languageItems: [NSMenuItem] = []
-    private var engineItems: [NSMenuItem] = []
-
-    private var selectedLocaleCode: String {
-        get { UserDefaults.standard.string(forKey: "selectedLocaleCode") ?? "zh-CN" }
-        set { UserDefaults.standard.set(newValue, forKey: "selectedLocaleCode") }
-    }
-
-    private var selectedEngine: String {
-        get { UserDefaults.standard.string(forKey: "selectedEngine") ?? "auto" }
-        set { UserDefaults.standard.set(newValue, forKey: "selectedEngine") }
-    }
-
-    private var removeChineseFillers: Bool {
-        get {
-            if UserDefaults.standard.object(forKey: "removeChineseFillers") == nil {
-                return true
+    private lazy var settingsWindow: SettingsWindow = {
+        let window = SettingsWindow()
+        window.onSaved = { [weak self] modelChanged in
+            self?.refreshMenuState()
+            if modelChanged {
+                self?.engineManager.restart()
             }
-            return UserDefaults.standard.bool(forKey: "removeChineseFillers")
         }
-        set { UserDefaults.standard.set(newValue, forKey: "removeChineseFillers") }
-    }
+        return window
+    }()
 
-    private var activeEngine: String {
-        if selectedEngine == "auto" {
-            return defaultEngine(for: selectedLocaleCode)
-        }
-        return selectedEngine
-    }
+    private var statusHeaderItem: NSMenuItem!
+    private var startItem: NSMenuItem!
+    private var stopItem: NSMenuItem!
+    private var restartItem: NSMenuItem!
+    private var copyItem: NSMenuItem!
+    private var privacyItem: NSMenuItem!
+    private var languageItems: [NSMenuItem] = []
 
-    // MARK: - Lifecycle
+    private var previousState = "stopped"
+    private var lastPresentedText = ""
+    private var overlayDismissWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let savedCode = selectedLocaleCode
-        if !savedCode.isEmpty {
-            speechEngine.locale = Locale(identifier: savedCode)
-        }
-
+        KeychainStore.migrateLegacyValueIfNeeded()
         setupStatusBar()
-        setupSpeechCallbacks()
-        setupWhisperCallbacks()
-        setupSenseVoiceCallbacks()
-
-        SpeechEngine.requestPermissions { [weak self] granted, errorMsg in
-            if !granted, let msg = errorMsg {
-                self?.showAlert(title: "Permission Required", message: msg)
-            }
+        setupAppMenu()
+        engineManager.onSnapshot = { [weak self] snapshot in
+            self?.handle(snapshot)
         }
-
-        keyMonitor.onFnDown = { [weak self] in self?.fnDown() }
-        keyMonitor.onFnUp = { [weak self] in self?.fnUp() }
-
-        requestAccessibilityIfNeeded()
+        engineManager.startPolling()
+        requestPermissions()
+        engineManager.start()
     }
 
-    // MARK: - Key events
-
-    private func fnDown() {
-        guard isEnabled, !isRecording else { return }
-
-        let engine = activeEngine
-        if engine == "whisper" && !whisperEngine.isModelLoaded {
-            overlayPanel.show(text: "Loading Whisper model…")
-            whisperEngine.loadModel(progress: { [weak self] msg in
-                DispatchQueue.main.async { self?.overlayPanel.updateText(msg) }
-            }) { [weak self] success in
-                guard let self else { return }
-                if success {
-                    self.overlayPanel.dismiss()
-                } else {
-                    self.overlayPanel.updateText("Failed to load Whisper model")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        self.overlayPanel.dismiss()
-                    }
-                }
-            }
-            return
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // VoiceInput 是唯一可见生命周期所有者；退出前等待 Python 恢复 Caps Lock 映射。
+        guard engineManager.isRunning else { return .terminateNow }
+        engineManager.stop {
+            sender.reply(toApplicationShouldTerminate: true)
         }
-
-        LLMRefiner.shared.cancel()
-        isRecording = true
-        recordingEngine = engine
-        lastPartialResult = ""
-
-        updateStatusIcon(recording: true)
-        overlayPanel.show(text: "Listening...")
-        NSSound(named: .init("Tink"))?.play()
-
-        if engine == "whisper" {
-            whisperEngine.startRecording()
-        } else if engine == "sensevoice" {
-            senseVoiceEngine.startRecording()
-        } else {
-            speechEngine.startRecording()
-        }
+        return .terminateLater
     }
 
-    private func fnUp() {
-        guard isRecording else { return }
-        isRecording = false
+    // MARK: - 状态与胶囊
 
-        updateStatusIcon(recording: false)
+    private func handle(_ snapshot: EngineSnapshot) {
+        refreshMenuState()
+        updateStatusIcon(recording: snapshot.state == "recording")
 
-        let engine = recordingEngine ?? activeEngine
-        recordingEngine = nil
-
-        if engine == "whisper" {
-            overlayPanel.updateText("Transcribing…")
-            whisperEngine.stopRecording()
-            // Use a longer timeout — Whisper transcribes after recording ends
-            finalResultTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: false) { [weak self] _ in
-                self?.finishTranscription()
+        switch snapshot.state {
+        case "starting", "loading_model":
+            if previousState != snapshot.state {
+                showOverlay(snapshot.message)
             }
-        } else if engine == "sensevoice" {
-            overlayPanel.updateText("Transcribing with SenseVoice…")
-            senseVoiceEngine.stopRecording()
-            finalResultTimer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: false) { [weak self] _ in
-                guard let self else { return }
-                self.senseVoiceEngine.cancel()
-                self.overlayPanel.updateText("SenseVoice timed out")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self.overlayPanel.dismiss()
-                }
+        case "recording":
+            if previousState != "recording" {
+                showOverlay("Listening…")
+                NSSound(named: .init("Tink"))?.play()
             }
-        } else {
-            speechEngine.stopRecording()
-            finalResultTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
-                self?.finishTranscription()
-            }
-        }
-    }
-
-    // MARK: - Speech callbacks
-
-    private func setupSpeechCallbacks() {
-        speechEngine.onPartialResult = { [weak self] text in
-            guard let self else { return }
-            self.lastPartialResult = text
-            self.overlayPanel.updateText(text)
-        }
-
-        speechEngine.onFinalResult = { [weak self] text in
-            guard let self else { return }
-            self.lastPartialResult = text
-            self.finalResultTimer?.invalidate()
-            self.finalResultTimer = nil
-            self.finishTranscription()
-        }
-
-        speechEngine.onError = { [weak self] msg in
-            guard let self else { return }
-            self.overlayPanel.updateText("Error: \(msg)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                self.overlayPanel.dismiss()
-            }
-        }
-
-        speechEngine.onAudioLevel = { [weak self] level in
-            self?.overlayPanel.updateAudioLevel(level)
-        }
-
-        speechEngine.onLocaleUnavailable = { [weak self] msg in
-            self?.showAlert(title: "Language Unavailable", message: msg)
-        }
-    }
-
-    private func setupWhisperCallbacks() {
-        whisperEngine.onFinalResult = { [weak self] text in
-            guard let self else { return }
-            self.lastPartialResult = text
-            self.finalResultTimer?.invalidate()
-            self.finalResultTimer = nil
-            self.finishTranscription()
-        }
-
-        whisperEngine.onError = { [weak self] msg in
-            guard let self else { return }
-            self.overlayPanel.updateText("Error: \(msg)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                self.overlayPanel.dismiss()
-            }
-        }
-
-        whisperEngine.onAudioLevel = { [weak self] level in
-            self?.overlayPanel.updateAudioLevel(level)
-        }
-    }
-
-    private func setupSenseVoiceCallbacks() {
-        senseVoiceEngine.onFinalResult = { [weak self] text in
-            guard let self else { return }
-            self.lastPartialResult = text
-            self.finalResultTimer?.invalidate()
-            self.finalResultTimer = nil
-            self.finishTranscription()
-        }
-
-        senseVoiceEngine.onError = { [weak self] msg in
-            guard let self else { return }
-            self.finalResultTimer?.invalidate()
-            self.finalResultTimer = nil
-            self.overlayPanel.updateText("Error: \(msg)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                self.overlayPanel.dismiss()
-            }
-        }
-
-        senseVoiceEngine.onAudioLevel = { [weak self] level in
-            self?.overlayPanel.updateAudioLevel(level)
-        }
-    }
-
-    private func finishTranscription() {
-        finalResultTimer?.invalidate()
-        finalResultTimer = nil
-
-        let rawText = lastPartialResult.trimmingCharacters(in: .whitespacesAndNewlines)
-        let text = postprocessTranscript(rawText)
-
-        guard !text.isEmpty else {
-            overlayPanel.dismiss()
-            lastPartialResult = ""
-            return
-        }
-
-        let refiner = LLMRefiner.shared
-        if refiner.isEnabled && refiner.isConfigured {
+            overlayPanel.updateAudioLevel(snapshot.audioLevel)
+        case "transcribing":
+            showOrUpdateOverlay("Transcribing…")
+        case "refining":
             overlayPanel.showRefining()
-            refiner.refine(text) { [weak self] result in
-                guard let self else { return }
-                let finalText: String
-                switch result {
-                case .success(let refined):
-                    finalText = refined.isEmpty ? text : refined
-                    let wasRefined = finalText != text
-                    if wasRefined {
-                        self.overlayPanel.updateText("✨ \(finalText)")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                            self.overlayPanel.dismiss()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                self.textInjector.inject(finalText)
-                                NSSound(named: .init("Pop"))?.play()
-                            }
-                        }
-                    } else {
-                        self.overlayPanel.dismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.textInjector.inject(finalText)
-                            NSSound(named: .init("Pop"))?.play()
-                        }
-                    }
-                case .failure(let error):
-                    NSLog("[LLMRefiner] Refine failed: %@", error.localizedDescription)
-                    finalText = text
-                    self.overlayPanel.updateText("Refine failed: \(error.localizedDescription)")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        self.overlayPanel.dismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.textInjector.inject(finalText)
-                            NSSound(named: .init("Pop"))?.play()
-                        }
-                    }
-                }
-                self.lastPartialResult = ""
-            }
-        } else {
-            overlayPanel.dismiss()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.textInjector.inject(text)
+        case "ready":
+            if !snapshot.lastText.isEmpty,
+               snapshot.lastText != lastPresentedText,
+               ["recording", "transcribing", "refining"].contains(previousState) {
+                lastPresentedText = snapshot.lastText
+                showOrUpdateOverlay(snapshot.lastText)
                 NSSound(named: .init("Pop"))?.play()
+                dismissOverlay(after: 1.2)
+            } else if ["starting", "loading_model"].contains(previousState) {
+                overlayPanel.dismiss()
             }
-            lastPartialResult = ""
+        case "model_missing", "runtime_missing", "permission_required", "error":
+            if previousState != snapshot.state {
+                showOverlay(snapshot.message)
+                dismissOverlay(after: 3.0)
+            }
+        case "stopped":
+            overlayPanel.dismiss()
+        default:
+            break
+        }
+        previousState = snapshot.state
+    }
+
+    private func showOverlay(_ text: String) {
+        overlayDismissWorkItem?.cancel()
+        overlayPanel.show(text: text)
+    }
+
+    private func showOrUpdateOverlay(_ text: String) {
+        overlayDismissWorkItem?.cancel()
+        if overlayPanel.isVisible {
+            overlayPanel.updateText(text)
+        } else {
+            overlayPanel.show(text: text)
         }
     }
 
-    private func postprocessTranscript(_ text: String) -> String {
-        guard removeChineseFillers, isChineseInputSelected else {
-            return text
-        }
-        return SpeechTextPostprocessor.removingChineseFillers(from: text)
+    private func dismissOverlay(after delay: TimeInterval) {
+        overlayDismissWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.overlayPanel.dismiss() }
+        overlayDismissWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    // MARK: - Status bar
+    // MARK: - 菜单栏
 
     private func setupStatusBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusIcon(recording: false)
-
         let menu = NSMenu()
+        menu.autoenablesItems = false
 
-        enableMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "")
-        enableMenuItem.target = self
-        enableMenuItem.state = .on
-        menu.addItem(enableMenuItem)
-
+        statusHeaderItem = NSMenuItem(title: "VoiceInput · Starting…", action: nil, keyEquivalent: "")
+        statusHeaderItem.isEnabled = false
+        menu.addItem(statusHeaderItem)
         menu.addItem(.separator())
 
-        let langItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
-        let langMenu = NSMenu()
+        startItem = menuItem("Start Engine", action: #selector(startEngine), symbol: "play.fill")
+        stopItem = menuItem("Stop Engine", action: #selector(stopEngine), symbol: "stop.fill")
+        restartItem = menuItem("Restart Engine", action: #selector(restartEngine), symbol: "arrow.clockwise")
+        menu.addItem(startItem)
+        menu.addItem(stopItem)
+        menu.addItem(restartItem)
+        menu.addItem(.separator())
+
+        let languageItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
+        let languageMenu = NSMenu()
         let languages: [(String, String)] = [
-            ("System Default", ""),
-            ("English (US)", "en-US"),
-            ("中文 (简体)", "zh-CN"),
-            ("中文 (繁體)", "zh-TW"),
-            ("日本語", "ja-JP"),
-            ("한국어", "ko-KR"),
+            ("Automatic", "auto"),
+            ("Chinese", "chinese"),
+            ("English", "english"),
+            ("Spanish", "spanish"),
+            ("Italian", "italian"),
+            ("French", "french"),
         ]
-        for (name, code) in languages {
-            let item = NSMenuItem(title: name, action: #selector(changeLanguage(_:)), keyEquivalent: "")
+        for (title, value) in languages {
+            let item = NSMenuItem(title: title, action: #selector(changeLanguage(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = code
-            item.state = code == selectedLocaleCode ? .on : .off
+            item.representedObject = value
             languageItems.append(item)
-            langMenu.addItem(item)
+            languageMenu.addItem(item)
         }
-        langItem.submenu = langMenu
-        menu.addItem(langItem)
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
 
-        cleanupMenuItem = NSMenuItem(title: "Remove Chinese Fillers", action: #selector(toggleRemoveChineseFillers), keyEquivalent: "")
-        cleanupMenuItem.target = self
-        cleanupMenuItem.state = removeChineseFillers ? .on : .off
-        menu.addItem(cleanupMenuItem)
-
-        // Recognition Engine submenu
-        let engineItem = NSMenuItem(title: "Recognition Engine", action: nil, keyEquivalent: "")
-        let engineMenu = NSMenu()
-        let engines: [(String, String)] = [
-            ("Auto by Language", "auto"),
-            ("Apple Speech", "apple"),
-            ("Whisper Medium", "whisper"),
-            ("SenseVoice Small", "sensevoice"),
-        ]
-        for (name, key) in engines {
-            let item = NSMenuItem(title: name, action: #selector(changeEngine(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = key
-            item.state = key == selectedEngine ? .on : .off
-            engineItems.append(item)
-            engineMenu.addItem(item)
-        }
-        engineItem.submenu = engineMenu
-        menu.addItem(engineItem)
-
-        // LLM Refinement submenu
-        let llmItem = NSMenuItem(title: "LLM Refinement", action: nil, keyEquivalent: "")
-        let llmMenu = NSMenu()
-
-        llmMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleLLM), keyEquivalent: "")
-        llmMenuItem.target = self
-        llmMenuItem.state = LLMRefiner.shared.isEnabled ? .on : .off
-        llmMenu.addItem(llmMenuItem)
-
-        llmMenu.addItem(.separator())
-
-        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openLLMSettings), keyEquivalent: "")
-        settingsItem.target = self
-        llmMenu.addItem(settingsItem)
-
-        llmItem.submenu = llmMenu
-        menu.addItem(llmItem)
-
+        copyItem = menuItem("Copy Last Result", action: #selector(copyLastResult), symbol: "doc.on.clipboard")
+        menu.addItem(copyItem)
+        menu.addItem(menuItem("Settings…", action: #selector(openSettings), symbol: "gearshape"))
+        privacyItem = menuItem(
+            "Open Privacy Settings…",
+            action: #selector(openPrivacySettings),
+            symbol: "hand.raised"
+        )
+        menu.addItem(privacyItem)
         menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit VoiceInput", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
+        menu.addItem(menuItem("Quit VoiceInput", action: #selector(quit), symbol: "power", keyEquivalent: "q"))
         statusItem.menu = menu
+        refreshMenuState()
+    }
+
+    private func menuItem(
+        _ title: String,
+        action: Selector,
+        symbol: String,
+        keyEquivalent: String = ""
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        return item
+    }
+
+    private func refreshMenuState() {
+        guard statusHeaderItem != nil else { return }
+        let snapshot = engineManager.snapshot
+        statusHeaderItem.title = statusTitle(for: snapshot)
+        let running = engineManager.isRunning
+        startItem.isEnabled = !running
+        stopItem.isEnabled = running
+        restartItem.isEnabled = running
+        copyItem.isEnabled = !snapshot.lastText.isEmpty
+        privacyItem.isHidden = snapshot.state != "permission_required"
+        let language = SettingsStore.shared.load().language
+        for item in languageItems {
+            item.state = (item.representedObject as? String) == language ? .on : .off
+        }
+    }
+
+    private func statusTitle(for snapshot: EngineSnapshot) -> String {
+        switch snapshot.state {
+        case "ready": return "● VoiceInput · Ready"
+        case "recording": return "● VoiceInput · Listening…"
+        case "transcribing": return "● VoiceInput · Transcribing…"
+        case "refining": return "● VoiceInput · Refining…"
+        case "starting", "loading_model": return "VoiceInput · \(snapshot.message)"
+        case "model_missing": return "VoiceInput · Model not installed"
+        case "permission_required": return "VoiceInput · Permission required"
+        case "runtime_missing": return "VoiceInput · Runtime not installed"
+        case "error": return "VoiceInput · Error"
+        default: return "VoiceInput · Stopped"
+        }
     }
 
     private func updateStatusIcon(recording: Bool) {
-        guard let button = statusItem.button else { return }
-        let name = recording ? "mic.fill" : "mic"
-        button.image = NSImage(systemSymbolName: name, accessibilityDescription: "Voice Input")
+        guard let button = statusItem?.button else { return }
+        button.image = NSImage(
+            systemSymbolName: recording ? "mic.fill" : "mic",
+            accessibilityDescription: "VoiceInput"
+        )
         button.contentTintColor = recording ? .systemRed : nil
     }
 
-    // MARK: - Actions
+    // MARK: - 菜单动作
 
-    @objc private func toggleEnabled() {
-        isEnabled.toggle()
-        enableMenuItem.state = isEnabled ? .on : .off
+    @objc private func startEngine() {
+        requestPermissions()
+        engineManager.start()
+    }
 
-        if isEnabled {
-            requestAccessibilityIfNeeded()
-        } else {
-            keyMonitor.stop()
-            if isRecording {
-                let engine = recordingEngine ?? activeEngine
-                recordingEngine = nil
-                if engine == "whisper" {
-                    whisperEngine.cancel()
-                } else if engine == "sensevoice" {
-                    senseVoiceEngine.cancel()
-                } else {
-                    speechEngine.cancel()
-                }
-                overlayPanel.dismiss()
-                isRecording = false
-                updateStatusIcon(recording: false)
-            }
-        }
+    @objc private func stopEngine() {
+        engineManager.stop()
+    }
+
+    @objc private func restartEngine() {
+        requestPermissions()
+        engineManager.restart()
     }
 
     @objc private func changeLanguage(_ sender: NSMenuItem) {
-        guard let code = sender.representedObject as? String else { return }
-        selectedLocaleCode = code
-        speechEngine.locale = code.isEmpty ? .current : Locale(identifier: code)
-
-        for item in languageItems {
-            item.state = (item.representedObject as? String) == code ? .on : .off
-        }
-        preloadWhisperIfNeeded()
-    }
-
-    @objc private func changeEngine(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        selectedEngine = key
-        updateEngineMenuState()
-        preloadWhisperIfNeeded()
-    }
-
-    @objc private func toggleRemoveChineseFillers() {
-        removeChineseFillers.toggle()
-        cleanupMenuItem.state = removeChineseFillers ? .on : .off
-    }
-
-    private var isChineseInputSelected: Bool {
-        let identifier = selectedLocaleCode.isEmpty ? Locale.current.identifier : selectedLocaleCode
-        return identifier.lowercased().hasPrefix("zh")
-    }
-
-    private func defaultEngine(for localeCode: String) -> String {
-        let identifier = localeCode.isEmpty ? Locale.current.identifier : localeCode
-        let code = identifier.lowercased()
-        if code.hasPrefix("zh") {
-            return "sensevoice"
-        }
-        if code.hasPrefix("en") {
-            return "whisper"
-        }
-        return "apple"
-    }
-
-    private func updateEngineMenuState() {
-        for item in engineItems {
-            item.state = (item.representedObject as? String) == selectedEngine ? .on : .off
+        guard let value = sender.representedObject as? String else { return }
+        var settings = SettingsStore.shared.load()
+        settings.language = value
+        do {
+            try SettingsStore.shared.save(settings)
+            refreshMenuState()
+        } catch {
+            showAlert(title: "Could Not Save Language", message: error.localizedDescription)
         }
     }
 
-    private func preloadWhisperIfNeeded() {
-        if activeEngine == "whisper" && !whisperEngine.isModelLoaded {
-            whisperEngine.loadModel { _ in }
-        }
+    @objc private func copyLastResult() {
+        let text = engineManager.snapshot.lastText
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
-    @objc private func toggleLLM() {
-        let refiner = LLMRefiner.shared
-        refiner.isEnabled.toggle()
-        llmMenuItem.state = refiner.isEnabled ? .on : .off
-    }
-
-    @objc private func openLLMSettings() {
+    @objc private func openSettings() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        setupAppMenu()
-        settingsWindow.makeKeyAndOrderFront(nil)
+        settingsWindow.show()
+    }
+
+    @objc private func openPrivacySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+
+    // MARK: - 权限
+
+    private func requestPermissions() {
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        }
+        if !AXIsProcessTrusted() {
+            let options = [
+                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true,
+            ] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+        }
+        // 输入监控没有可靠的主动授权 API；Python 引擎首次创建 CGEventTap 时会让系统登记条目。
     }
 
     private func setupAppMenu() {
         guard NSApp.mainMenu == nil else { return }
         let mainMenu = NSMenu()
-
         let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Quit VoiceInput", action: #selector(quit), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
 
         let editMenuItem = NSMenuItem()
-        mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
-
+        mainMenu.addItem(editMenuItem)
         NSApp.mainMenu = mainMenu
-    }
-
-    @objc private func quit() {
-        keyMonitor.stop()
-        NSApp.terminate(nil)
-    }
-
-    // MARK: - Accessibility
-
-    private func requestAccessibilityIfNeeded() {
-        if AXIsProcessTrusted() {
-            if !keyMonitor.start() {
-                // Trusted but tap failed — permission may have just been granted; retry once
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                    _ = self?.keyMonitor.start()
-                }
-            }
-            return
-        }
-
-        // Prompt macOS to show its native accessibility permission dialog
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(options)
-
-        // Poll until the user grants permission (check every second, up to 60s)
-        var attempts = 0
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
-            attempts += 1
-            if AXIsProcessTrusted() {
-                timer.invalidate()
-                _ = self?.keyMonitor.start()
-            } else if attempts >= 60 {
-                timer.invalidate()
-            }
-        }
     }
 
     private func showAlert(title: String, message: String) {
@@ -551,7 +316,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
         alert.runModal()
     }
 }

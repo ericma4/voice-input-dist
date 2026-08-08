@@ -4,15 +4,11 @@ import PackageDescription
 let package = Package(
     name: "VoiceInput",
     platforms: [.macOS(.v14)],
-    dependencies: [
-        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.9.0"),
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "VoiceInput",
-            dependencies: [
-                .product(name: "WhisperKit", package: "WhisperKit"),
-            ],
+            dependencies: [],
             path: "Sources/VoiceInput"
         )
     ]

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# VoiceInput 的备用 CLI。正常使用请通过菜单；此入口只负责诊断和自动化。
+set -euo pipefail
+
+APP_SUPPORT="$HOME/Library/Application Support/VoiceInput"
+PYTHON="$APP_SUPPORT/Runtime/venv/bin/python"
+ENGINE_ROOT="/Applications/VoiceInput.app/Contents/Resources/Engine"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "VoiceInput runtime is not installed. Run make install from the repository." >&2
+    exit 1
+fi
+if [[ ! -d "$ENGINE_ROOT/voiceinput_engine" ]]; then
+    echo "VoiceInput.app is not installed in /Applications." >&2
+    exit 1
+fi
+
+# 引擎源码来自已签名的应用包；诊断命令不得在包内生成 Python 字节码缓存。
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ENGINE_ROOT" exec "$PYTHON" -m voiceinput_engine "$@"
