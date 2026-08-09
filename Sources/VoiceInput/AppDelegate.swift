@@ -26,7 +26,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var languageItems: [NSMenuItem] = []
 
     private var previousState = "stopped"
-    private var lastPresentedText = ""
     private var overlayDismissWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -72,13 +71,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "refining":
             overlayPanel.showRefining()
         case "ready":
-            if !snapshot.lastText.isEmpty,
-               snapshot.lastText != lastPresentedText,
-               ["recording", "transcribing", "refining"].contains(previousState) {
-                lastPresentedText = snapshot.lastText
-                showOrUpdateOverlay(snapshot.lastText)
+            if ["recording", "transcribing", "refining"].contains(previousState) {
+                // 转写结果已经由引擎直接粘贴；胶囊只负责显示过程状态，完成后立即收起。
                 NSSound(named: .init("Pop"))?.play()
-                dismissOverlay(after: 1.2)
+                overlayPanel.dismiss()
             } else if ["starting", "loading_model"].contains(previousState) {
                 overlayPanel.dismiss()
             }
