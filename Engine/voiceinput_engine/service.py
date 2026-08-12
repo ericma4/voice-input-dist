@@ -24,7 +24,7 @@ from .llm import refine
 from .output import copy_and_optionally_paste
 from .paths import ENGINE_LOG_PATH, PID_PATH, ensure_directories
 from .postprocess import remove_fillers
-from .recorder import AudioRecorder
+from .recorder import AudioRecorder, AudioStreamCloseTimeout
 from .state import StatePublisher
 
 
@@ -252,7 +252,7 @@ class VoiceInputEngine:
             self.state.update(audio_level=round(level, 3))
 
     def _start_recording(self) -> None:
-        if not (self.model_ready and self.keyboard_ready) or self.asr is None:
+        if self.stop_event.is_set() or not (self.model_ready and self.keyboard_ready) or self.asr is None:
             return
         if self._recognition_pending.is_set() or self._recognition_lock.locked() or self.recorder.active:
             return
@@ -266,7 +266,19 @@ class VoiceInputEngine:
     def _stop_recording(self) -> None:
         if not self.recorder.active:
             return
-        samples = self.recorder.stop()
+        try:
+            samples = self.recorder.stop()
+        except AudioStreamCloseTimeout:
+            # PortAudio 的原生关闭调用无法从 Python 取消。要求主循环退出；shutdown 会先
+            # 恢复 Caps 映射，进程入口随后用 os._exit 跳过已知会死锁的 sounddevice atexit。
+            logger.error("microphone close timed out; terminating engine")
+            self.state.update(
+                state="error",
+                message="Microphone did not close. Restart VoiceInput.",
+                audio_level=0.0,
+            )
+            self.stop_event.set()
+            return
         if samples.size < 1600:
             self._publish_resting_state()
             return
@@ -323,5 +335,16 @@ def main() -> int:
     return VoiceInputEngine().run()
 
 
+def run_process(exit_process=os._exit) -> None:
+    """运行专用引擎并直接退出，避免 sounddevice 的 Pa_Terminate atexit 死锁。"""
+    exit_code = 1
+    try:
+        exit_code = main()
+    except BaseException as exc:
+        # run() 的 finally 已负责常规清理；这里覆盖初始化早期等未预料异常。
+        logger.exception("engine process failed: %s", type(exc).__name__)
+    exit_process(exit_code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run_process()

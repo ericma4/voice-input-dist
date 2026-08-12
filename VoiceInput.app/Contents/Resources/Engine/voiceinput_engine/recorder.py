@@ -9,11 +9,16 @@ import numpy as np
 import sounddevice as sd
 
 
+class AudioStreamCloseTimeout(RuntimeError):
+    """PortAudio 未能及时关闭输入流；继续复用该进程可能永久占用麦克风。"""
+
+
 class AudioRecorder:
     """一次长按对应一次内存录音；从不把原始音频写入磁盘。"""
 
     SAMPLE_RATE = 48000
     BLOCK_DURATION = 0.05
+    CLOSE_TIMEOUT_SECONDS = 5.0
 
     def __init__(self, on_level: Callable[[float], None]) -> None:
         self._on_level = on_level
@@ -62,9 +67,16 @@ class AudioRecorder:
         if stream is not None:
             closer = threading.Thread(target=self._close_stream, args=(stream,), daemon=True)
             closer.start()
-            closer.join(timeout=5.0)
+            closer.join(timeout=self.CLOSE_TIMEOUT_SECONDS)
+            close_timed_out = closer.is_alive()
+        else:
+            close_timed_out = False
 
         self._on_level(0.0)
+        if close_timed_out:
+            # 这个线程已卡在 PortAudio/CoreAudio 原生调用，Python 无法安全取消。
+            # 上层会恢复 Caps 映射并立即结束专用引擎进程，从而由操作系统释放麦克风。
+            raise AudioStreamCloseTimeout("PortAudio input stream did not close in time")
         if not chunks:
             return np.asarray([], dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)
